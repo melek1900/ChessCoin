@@ -1,0 +1,104 @@
+// ---------- Data source & generator ----------
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---------- Models ----------
+model User {
+  id              String   @id @default(cuid())
+  email           String?  @unique
+  lichessId       String?  @unique
+  lichessUsername String?  @unique
+  createdAt       DateTime @default(now())
+
+  balance      Balance?
+  matchesWhite Match[]      @relation("white")
+  matchesBlack Match[]      @relation("black")
+  txs          TxLedger[] // 👈 renommé (ex-TxLedger)
+  lichessAuth  LichessAuth? // 👈 1-à-1 (pas un tableau)
+}
+
+model Balance {
+  userId    String   @id
+  user      User     @relation(fields: [userId], references: [id])
+  chessCC   Int      @default(0) // ChessCoin
+  updatedAt DateTime @updatedAt
+}
+
+enum TxType {
+  gain
+  spend
+  stake_hold
+  stake_release
+  refund
+}
+
+model TxLedger {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  type      TxType
+  amount    Int
+  ref       String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@unique([userId, type, ref])
+}
+
+enum Source {
+  lichess
+  ai
+  native
+}
+
+enum Result {
+  W
+  L
+  D
+  abort
+}
+
+model Match {
+  id            String   @id @default(cuid())
+  source        Source
+  lichessGameId String?  @unique
+  white         User?    @relation("white", fields: [whiteId], references: [id])
+  whiteId       String?
+  black         User?    @relation("black", fields: [blackId], references: [id])
+  blackId       String?
+  stakeCC       Int      @default(0)
+  result        Result?
+  pgn           String?
+  createdAt     DateTime @default(now())
+  escrow        Escrow?
+
+  @@index([createdAt])
+}
+
+enum EscrowStatus {
+  held
+  resolved
+  refunded
+}
+
+model Escrow {
+  matchId   String       @id
+  match     Match        @relation(fields: [matchId], references: [id])
+  whiteHold Int
+  blackHold Int
+  status    EscrowStatus @default(held)
+}
+
+model LichessAuth {
+  userId      String   @id
+  user        User     @relation(fields: [userId], references: [id])
+  accessToken String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

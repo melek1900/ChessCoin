@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    container_name: chesscoin-db
+    restart: unless-stopped
+    ports:
+      - "5440:5432" # host:container
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chesscoin
+    volumes:
+      - chesscoin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chesscoin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  chesscoin_pgdata:
