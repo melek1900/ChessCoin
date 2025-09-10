@@ -216,3 +216,31 @@ input:focus{
   all:unset; cursor:pointer; opacity:.7; padding:0 4px; font-size:18px;
 }
 .toast button:hover{ opacity:1 }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #eee;
+  color: #333;
+}
+.pill.ok { background: #dff6dd; color: #0f5132; }
+.pill.off { background: #f0f0f0; color: #666; }
+.pill .pill-sub { opacity: .8; margin-left: 6px; font-weight: 500; }
+
+.banner.live {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  background: #333;
+  border: 1px solid #f6e3a1;
+  border-radius: 10px;
+  font-size: 14px;
+}
+.banner.live a {
+  color: white;
+  text-decoration: underline;
+}
+.banner.live a:hover {
+  text-decoration: none;
+}

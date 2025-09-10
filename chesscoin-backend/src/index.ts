@@ -6,8 +6,6 @@ import { auth } from './middleware/auth';
 import { signAccessToken, verifyAccessToken } from './jwt';
 import { holdStake, resolveMatch } from './wallet';
 
-// Map pour associer une partie lichess au dernier match “stake” créé par l’utilisateur
-
 import {
   buildLinkAuthUrl,
   pkceStore,
@@ -26,12 +24,13 @@ const db = new PrismaClient();
 app.use(cors({ origin: process.env.FRONT_ORIGIN || true, credentials: false }));
 app.use(express.json());
 
-
-// --- Matchmaking in-memory (pas de migration DB) ---
+/* ------------------------------------------------------------------ */
+/* Matchmaking in-memory (pas de migration DB)                        */
+/* ------------------------------------------------------------------ */
 type MMKey = `${number}+${number}+${number}+${0|1}`; // time+inc+stake+rated(0/1)
 type Ticket = { userId: string; username: string; stake: number; time: number; inc: number; rated: boolean; ts: number };
 
-const mmQueues = new Map<MMKey, Ticket[]>(); // file d'attente
+const mmQueues = new Map<MMKey, Ticket[]>();
 function mmKey(time: number, inc: number, stake: number, rated: boolean): MMKey {
   return `${time}+${inc}+${stake}+${rated ? 1 : 0}`;
 }
@@ -53,8 +52,9 @@ type PendingChallenge = {
 };
 const pendingChallenges = new Map<string, PendingChallenge>(); // matchId -> data
 
-
-// ---------------- Health ----------------
+/* ------------------------------------------------------------------ */
+/* Health                                                             */
+/* ------------------------------------------------------------------ */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.get('/health/db', async (_req, res) => {
   try {
@@ -65,14 +65,16 @@ app.get('/health/db', async (_req, res) => {
   }
 });
 
-// ------------- Dev signup (JWT rapide) -------------
+/* ------------------------------------------------------------------ */
+/* Dev signup (JWT rapide)                                            */
+/* ------------------------------------------------------------------ */
 app.post('/dev/signup', async (req, res) => {
   const email = (req.body?.email as string) ?? `u${Date.now()}@mail.test`;
   try {
     const user = await db.user.create({ data: { email } });
     // Balance.updatedAt est @updatedAt NOT NULL → initialise-la
     await db.balance.create({ data: { userId: user.id, updatedAt: new Date() } });
-    const token = signAccessToken(user.id); // durée par défaut selon jwt.ts
+    const token = signAccessToken(user.id);
     res.json({ user, token });
   } catch (e: any) {
     if (e.code === 'P2002') {
@@ -83,7 +85,9 @@ app.post('/dev/signup', async (req, res) => {
   }
 });
 
-// ---------------- Lichess LINK (protégé) ----------------
+/* ------------------------------------------------------------------ */
+/* Lichess LINK (protégé)                                             */
+/* ------------------------------------------------------------------ */
 
 // 1) Démarrer l’OAuth pour lier le compte Lichess
 app.get('/lichess/login', auth, async (req, res) => {
@@ -187,6 +191,10 @@ app.get('/lichess/callback', async (req, res) => {
     return res.status(500).send('OAuth failed: ' + (e?.message || 'unknown'));
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* Play staké (solo)                                                  */
+/* ------------------------------------------------------------------ */
 app.post('/play/staked', auth, async (req, res) => {
   try {
     const userId = req.userId as string;
@@ -196,29 +204,19 @@ app.post('/play/staked', auth, async (req, res) => {
     const authRow = await db.lichessAuth.findUnique({ where: { userId } });
     if (!authRow) return res.status(400).json({ ok:false, error:'link lichess first' });
 
-    // Crée un match “en attente” (pas encore de lichessGameId)
+    // Crée un match “en attente”
     const match = await db.match.create({
-      data: {
-        source: 'lichess',
-        stakeCC: stake,
-      }
+      data: { source: 'lichess', stakeCC: stake }
     });
 
-    // Bloque la mise de l’utilisateur (on ne connait pas encore sa couleur)
-    await holdStake({
-      matchId: match.id,
-      whoUserId: userId,
-      whoColor: 'white', // temporaire: sera ajusté à la résolution si besoin
-      stake,
-    });
+    // Bloque la mise du user (couleur provisoire)
+    await holdStake({ matchId: match.id, whoUserId: userId, whoColor: 'white', stake });
 
-    // Tag “pending” pour l’utilisateur → le prochain gameStart/gameFinish lui sera associé
+    // Tag pending → prochain gameStart/gameFinish
     pendingStakeByUser.set(userId, match.id);
 
-    // Démarre le stream si pas actif
+    // Assure stream & lance une seek
     await ensureStreamFor(userId, authRow.accessToken);
-
-    // Ouvre une seek 3+0 (tu peux exposer time/inc/rated/color si besoin)
     await createSeek(authRow.accessToken, { time: 3, increment: 0, rated: false, color: 'random' });
 
     return res.json({ ok: true, launch: 'https://lichess.org/' });
@@ -227,15 +225,27 @@ app.post('/play/staked', auth, async (req, res) => {
   }
 });
 
-// 3) Statut du lien Lichess
+/* ------------------------------------------------------------------ */
+/* Lichess LINK status                                                */
+/* ------------------------------------------------------------------ */
 app.get('/lichess/status', auth, async (req, res) => {
   const u = await db.user.findUnique({ where: { id: req.userId } });
   res.json({ linked: Boolean(u?.lichessId), username: u?.lichessUsername ?? null });
 });
 
-// ------------- Stream & récompense -------------
+/* ------------------------------------------------------------------ */
+/* Stream & récompense + statut                                       */
+/* ------------------------------------------------------------------ */
 type GameFinishEvent = { type: 'gameFinish'; game: { id: string } };
-const runningStreams = new Map<string, () => void>(); // userId -> stop()
+type GameStartEvent  = { type: 'gameStart';  game: { id: string } };
+type AnyEvent = GameFinishEvent | GameStartEvent | { type?: string; [k: string]: any };
+
+type StreamInfo = {
+  stop: () => void;
+  lastEventAt: number | null;
+  lastGameId: string | null;
+};
+const runningStreams = new Map<string, StreamInfo>(); // userId -> info
 
 function rewardFromSummary(
   summary: { winner?: 'white' | 'black'; status?: string },
@@ -249,7 +259,52 @@ function rewardFromSummary(
   return win ? 8 : 1;
 }
 
-// Types d’événements Lichess (simplifiés)
+async function startStreamIfPossible(userId: string) {
+  const authRow = await db.lichessAuth.findUnique({ where: { userId } });
+  if (!authRow) return;
+  if (runningStreams.get(userId)) return;
+  await ensureStreamFor(userId, authRow.accessToken);
+}
+
+// Statut du stream
+app.get('/lichess/stream/status', auth, async (req, res) => {
+  const userId = req.userId as string;
+  const info = runningStreams.get(userId) || null;
+  res.json({
+    streaming: Boolean(info),
+    lastEventAt: info?.lastEventAt ?? null,
+    lastGameId: info?.lastGameId ?? null
+  });
+});
+
+// Start/Stop manuels
+app.post('/lichess/stream/start', auth, async (req, res) => {
+  try {
+    const userId = req.userId as string;
+    const authRow = await db.lichessAuth.findUnique({ where: { userId } });
+    if (!authRow) return res.status(400).json({ ok: false, error: 'link lichess first' });
+
+    // reset si déjà lancé
+    const info = runningStreams.get(userId);
+    info?.stop?.();
+    runningStreams.delete(userId);
+
+    await ensureStreamFor(userId, authRow.accessToken);
+    res.json({ ok: true, streaming: true });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/lichess/stream/stop', auth, async (req, res) => {
+  const userId = req.userId as string;
+  const info = runningStreams.get(userId);
+  info?.stop?.();
+  runningStreams.delete(userId);
+  res.json({ ok: true, streaming: false });
+});
+
+// Types d’événements (simplifiés)
 type LichessEvent =
   | { type: 'gameStart'; game: { id: string } }
   | { type: 'gameFinish'; game: { id: string } }
@@ -260,6 +315,15 @@ async function ensureStreamFor(userId: string, accessToken: string): Promise<voi
   if (runningStreams.get(userId)) return;
 
   const stop = await streamUserEvents(accessToken, async (ev: LichessEvent) => {
+    // book-keeping pour le statut
+    const info = runningStreams.get(userId);
+    if (info) {
+      info.lastEventAt = Date.now();
+      const gid = (ev as any)?.game?.id;
+      if (gid) info.lastGameId = gid;
+      runningStreams.set(userId, info);
+    }
+
     // ---------- Lier le match stake "pending" au gameId au démarrage ----------
     if (ev?.type === 'gameStart' && ev?.game?.id) {
       const matchId = pendingStakeByUser.get(userId);
@@ -270,7 +334,6 @@ async function ensureStreamFor(userId: string, accessToken: string): Promise<voi
             data: { lichessGameId: ev.game.id },
           });
 
-          // marquer le pending challenge comme "started" et annuler son timeout
           const pend = pendingChallenges.get(matchId);
           if (pend) {
             pend.started = true;
@@ -362,13 +425,9 @@ async function ensureStreamFor(userId: string, accessToken: string): Promise<voi
             blackUserId: match.blackId ?? null,
           });
 
-          // Nettoyage des pendings (challenge & user)
+          // Nettoyage des pendings
           const pend = pendingChallenges.get(match.id);
-          if (pend) {
-            clearTimeout(pend.timeout);
-            pendingChallenges.delete(match.id);
-          }
-          // On peut avoir deux entrées (les deux users). On tente un delete sûr :
+          if (pend) { clearTimeout(pend.timeout); pendingChallenges.delete(match.id); }
           pendingStakeByUser.delete(userId);
           if (opponentUserId) pendingStakeByUser.delete(opponentUserId);
 
@@ -401,18 +460,12 @@ async function ensureStreamFor(userId: string, accessToken: string): Promise<voi
     }
   });
 
-  runningStreams.set(userId, stop);
+  runningStreams.set(userId, { stop, lastEventAt: Date.now(), lastGameId: null });
 }
 
-
-async function startStreamIfPossible(userId: string) {
-  const authRow = await db.lichessAuth.findUnique({ where: { userId } });
-  if (!authRow) return;
-  if (runningStreams.get(userId)) return;
-  await ensureStreamFor(userId, authRow.accessToken);
-}
-
-// --- DEV: inspecter/rebooter les streams ---
+/* ------------------------------------------------------------------ */
+/* DEV streams helpers                                                */
+/* ------------------------------------------------------------------ */
 app.get('/dev/streams', async (_req, res) => {
   res.json({ running: Array.from(runningStreams.keys()) });
 });
@@ -422,7 +475,7 @@ app.post('/dev/streams/restart', auth, async (req, res) => {
   try {
     const authRow = await db.lichessAuth.findUnique({ where: { userId } });
     if (!authRow) return res.status(400).json({ ok: false, error: 'link lichess first' });
-    runningStreams.get(userId)?.();
+    runningStreams.get(userId)?.stop?.();
     runningStreams.delete(userId);
     await ensureStreamFor(userId, authRow.accessToken);
     return res.json({ ok: true, restarted: true });
@@ -431,7 +484,9 @@ app.post('/dev/streams/restart', auth, async (req, res) => {
   }
 });
 
-// ------------- Jouer vite (3+0 casual) -------------
+/* ------------------------------------------------------------------ */
+/* Jouer vite (3+0 casual)                                            */
+/* ------------------------------------------------------------------ */
 app.post('/play/quick', auth, async (req, res) => {
   try {
     const userId = req.userId as string;
@@ -446,7 +501,10 @@ app.post('/play/quick', auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
-// POST /play/staked/challenge  { opponent: string, stake: number, time?: number, increment?: number, rated?: boolean }
+
+/* ------------------------------------------------------------------ */
+/* Défi ami (stake)                                                   */
+/* ------------------------------------------------------------------ */
 app.post('/play/staked/challenge', auth, async (req, res) => {
   try {
     const userId = req.userId as string;
@@ -472,7 +530,7 @@ app.post('/play/staked/challenge', auth, async (req, res) => {
       data: { source: 'lichess', stakeCC: stakeN, whiteId: null, blackId: null }
     });
 
-    await holdStake({ matchId: match.id, whoUserId: userId, whoColor: 'white', stake: stakeN }); // couleur provisoire, on corrigera à la résolution
+    await holdStake({ matchId: match.id, whoUserId: userId, whoColor: 'white', stake: stakeN }); // couleur provisoire
 
     // Enregistre pending pour A et B → lier au gameStart
     pendingStakeByUser.set(userId, match.id);
@@ -486,8 +544,7 @@ app.post('/play/staked/challenge', auth, async (req, res) => {
     await ensureStreamFor(userId, aTok);
     await ensureStreamFor(opp.id, bAuth.accessToken);
 
-    // Crée le challenge direct vers l'adversaire
-    // cf. https://lichess.org/api#operation/challengeCreate
+    // Challenge direct vers l'adversaire (API Lichess)
     const body = new URLSearchParams({
       rated: String(rated),
       clock: JSON.stringify({ limit: time * 60, increment }),
@@ -506,7 +563,7 @@ app.post('/play/staked/challenge', auth, async (req, res) => {
       return res.status(500).json({ ok:false, error: `lichess challenge failed: ${txt}` });
     }
 
-    // Timeout: si la partie ne démarre pas, on annule et on rembourse le challenger
+    // Timeout: si la partie ne démarre pas, on annule et on rembourse
     const timeout = setTimeout(async () => {
       try {
         const m = await db.match.findUnique({ where: { id: match.id } });
@@ -542,7 +599,10 @@ app.post('/play/staked/challenge', auth, async (req, res) => {
     return res.status(500).json({ ok:false, error: e.message });
   }
 });
-// POST /queue/join { stake:number, time?:number, increment?:number, rated?:boolean }
+
+/* ------------------------------------------------------------------ */
+/* Queue matchmaking                                                  */
+/* ------------------------------------------------------------------ */
 app.post('/queue/join', auth, async (req, res) => {
   try {
     const userId = req.userId as string;
@@ -560,13 +620,12 @@ app.post('/queue/join', auth, async (req, res) => {
 
     const key = mmKey(time, increment, stakeN, rated);
     const q = mmQueues.get(key) ?? [];
-    // vérifie si déjà en file
     if (q.find(t => t.userId === userId)) return res.json({ ok:true, queued: true });
 
     q.push({ userId, username: me.lichessUsername!, stake: stakeN, time, inc: increment, rated, ts: Date.now() });
     mmQueues.set(key, q);
 
-    // matchmaking simple: si deux en file, matche-les
+    // matchmaking simple
     if (q.length >= 2) {
       const a = q.shift()!;
       const b = q.shift()!;
@@ -577,17 +636,17 @@ app.post('/queue/join', auth, async (req, res) => {
       await holdStake({ matchId: match.id, whoUserId: a.userId, whoColor: 'white', stake: stakeN });
       await holdStake({ matchId: match.id, whoUserId: b.userId, whoColor: 'black', stake: stakeN });
 
-      // marquer pending pour lier au gameStart / gameFinish
+      // pending
       pendingStakeByUser.set(a.userId, match.id);
       pendingStakeByUser.set(b.userId, match.id);
 
-      // assurer les streams
+      // streams
       const aTok = (await db.lichessAuth.findUnique({ where: { userId: a.userId } }))!.accessToken;
       const bTok = (await db.lichessAuth.findUnique({ where: { userId: b.userId } }))!.accessToken;
       await ensureStreamFor(a.userId, aTok);
       await ensureStreamFor(b.userId, bTok);
 
-      // A challenge B (ciblé)
+      // A challenge B
       const body = new URLSearchParams({
         rated: String(rated),
         clock: JSON.stringify({ limit: time * 60, increment }),
@@ -650,7 +709,6 @@ app.post('/queue/join', auth, async (req, res) => {
   }
 });
 
-// POST /queue/leave
 app.post('/queue/leave', auth, async (req, res) => {
   try {
     const userId = req.userId as string;
@@ -667,7 +725,9 @@ app.post('/queue/leave', auth, async (req, res) => {
   }
 });
 
-// ------------- Me / Wallet / History -------------
+/* ------------------------------------------------------------------ */
+/* Me / Wallet / History                                              */
+/* ------------------------------------------------------------------ */
 app.get('/me', auth, async (req, res) => {
   const userId = req.userId as string;
   const me = await db.user.findUnique({
@@ -729,40 +789,9 @@ app.get('/history', auth, async (req, res) => {
   });
 });
 
-// ------------- DEV unlink helpers (optionnel) -------------
-app.post('/dev/unlink-lichess/self', auth, async (req, res) => {
-  const userId = req.userId as string;
-  const u = await db.user.findUnique({ where: { id: userId } });
-  if (!u?.lichessId) return res.json({ ok: true, already: true });
-  await db.lichessAuth.deleteMany({ where: { userId } });
-  await db.user.update({ where: { id: userId }, data: { lichessId: null, lichessUsername: null } });
-  res.json({ ok: true });
-});
-
-app.post('/dev/unlink-lichess/by-username', async (req, res) => {
-  const username = (req.body?.username as string)?.trim().toLowerCase();
-  if (!username) return res.status(400).json({ ok: false, error: 'missing username' });
-  const u = await db.user.findFirst({
-    where: { lichessUsername: { equals: username, mode: 'insensitive' } },
-  });
-  if (!u) return res.json({ ok: true, notFound: true });
-  await db.lichessAuth.deleteMany({ where: { userId: u.id } });
-  await db.user.update({
-    where: { id: u.id },
-    data: { lichessId: null, lichessUsername: null },
-  });
-  res.json({ ok: true, unlinkedUserId: u.id });
-});
-
-app.post('/dev/unlink-lichess/by-id', async (req, res) => {
-  const lichessId = (req.body?.lichessId as string)?.trim();
-  if (!lichessId) return res.status(400).json({ ok: false, error: 'missing lichessId' });
-  const u = await db.user.findUnique({ where: { lichessId } });
-  if (!u) return res.json({ ok: true, notFound: true });
-  await db.lichessAuth.deleteMany({ where: { userId: u.id } });
-  await db.user.update({ where: { id: u.id }, data: { lichessId: null, lichessUsername: null } });
-  res.json({ ok: true, unlinkedUserId: u.id });
-});
+/* ------------------------------------------------------------------ */
+/* Leaderboards                                                       */
+/* ------------------------------------------------------------------ */
 app.get('/leaderboard/balance', async (_req, res) => {
   const rows = await db.balance.findMany({
     orderBy: [{ chessCC: 'desc' }, { updatedAt: 'desc' }],
@@ -780,6 +809,7 @@ app.get('/leaderboard/balance', async (_req, res) => {
     }))
   });
 });
+
 app.get('/leaderboard/gains30d', async (_req, res) => {
   const since = new Date(Date.now() - 30*24*60*60*1000);
   const rows = await db.txLedger.groupBy({
@@ -790,9 +820,7 @@ app.get('/leaderboard/gains30d', async (_req, res) => {
     take: 50,
   });
 
-  const users = await db.user.findMany({
-    where: { id: { in: rows.map(r => r.userId) } }
-  });
+  const users = await db.user.findMany({ where: { id: { in: rows.map(r => r.userId) } } });
   const byId = new Map(users.map(u => [u.id, u]));
 
   res.json({
@@ -807,7 +835,9 @@ app.get('/leaderboard/gains30d', async (_req, res) => {
   });
 });
 
-// ------------- Auto-restore streams au boot -------------
+/* ------------------------------------------------------------------ */
+/* Auto-restore streams au boot                                       */
+/* ------------------------------------------------------------------ */
 (async () => {
   try {
     const rows = await db.lichessAuth.findMany();
@@ -820,7 +850,9 @@ app.get('/leaderboard/gains30d', async (_req, res) => {
   }
 })();
 
-// ------------- Shutdown propre -------------
+/* ------------------------------------------------------------------ */
+/* Shutdown propre                                                    */
+/* ------------------------------------------------------------------ */
 async function shutdown(code = 0) {
   try { await db.$disconnect(); } catch {}
   process.exit(code);

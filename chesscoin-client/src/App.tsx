@@ -99,6 +99,12 @@ type LbGainsResponse = {
   }[];
 };
 
+type StreamStatus = {
+  streaming: boolean;
+  lastEventAt: number | null;
+  lastGameId: string | null;
+};
+
 /* -------------------------------------------------------
  * App
  * ----------------------------------------------------- */
@@ -244,12 +250,45 @@ function Dashboard({
   const [refreshTick, setRefreshTick] = useState(0);
   const pokeRefresh = () => setRefreshTick((t) => t + 1);
 
+  // ---- Statut de stream
+  const [stream, setStream] = useState<StreamStatus | null>(null);
+  const loadStream = async () => {
+    try {
+      const r = await fetchJson<StreamStatus>(`${API}/lichess/stream/status`, {
+        headers: authHeader(token),
+      });
+      setStream(r);
+    } catch {
+      setStream({ streaming: false, lastEventAt: null, lastGameId: null });
+    }
+  };
+  useEffect(() => { if (linked) loadStream(); }, [linked]);
+  useEffect(() => { if (linked) loadStream(); }, [refreshTick]);
+
+  const streamBadge = (
+    <span className={`pill ${stream?.streaming ? 'ok' : 'off'}`}>
+      {stream?.streaming ? 'Stream ON' : 'Stream OFF'}
+      {stream?.lastEventAt ? (
+        <span className="pill-sub">· vu {new Date(stream.lastEventAt).toLocaleTimeString()}</span>
+      ) : null}
+    </span>
+  );
+
   return (
     <div className="grid">
       <section className="card">
         <h2>Mon compte</h2>
+
+        {/* Mini-bannière match en cours */}
+        {stream?.streaming && stream?.lastGameId ? (
+          <div className="banner live">
+            Match en cours ·{" "}
+            <a  href={`https://lichess.org/${stream.lastGameId}`} target="_blank">ouvrir</a>
+          </div>
+        ) : null}
+
         {loading ? <SkeletonRows rows={2} /> : null}
-        <div className="row">
+        <div className="row between" style={{ marginBottom: 8 }}>
           <div>
             <div className="kv">
               <span>Utilisateur</span>
@@ -264,6 +303,10 @@ function Dashboard({
               <b>{me?.balance?.chessCC ?? 0} CC</b>
             </div>
           </div>
+          <div className="row">{linked ? streamBadge : <span className="pill off">Stream OFF</span>}</div>
+        </div>
+
+        <div className="row">
           <div className="right">
             {!linked ? (
               <LinkLichess
